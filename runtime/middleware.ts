@@ -247,6 +247,7 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
         pathname: url.pathname,
         userAgent: ctx.req.raw.headers.get("user-agent") || undefined,
         correlationId: ctx.var.correlationId,
+        ip: ctx.req.raw.headers.get("x-forwarded-for") || undefined,
       };
 
       await withRequestContext(requestContext, async () => {

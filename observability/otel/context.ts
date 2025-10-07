@@ -10,6 +10,7 @@ interface RequestContext {
   pathname?: string;
   userAgent?: string;
   correlationId?: string;
+  ip?: string;
 }
 
 export const requestContextStore = new AsyncLocalStorage<RequestContext>();

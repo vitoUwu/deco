@@ -165,6 +165,7 @@ export class OpenTelemetryHandler extends log.BaseHandler {
         "request.pathname": context?.pathname,
         "request.userAgent": context?.userAgent,
         "request.correlationId": context?.correlationId,
+        "request.ip": (context as { ip?: string })?.ip,
       };
     } catch (error) {
       console.error("Error extracting request context:", error);
