@@ -56,6 +56,7 @@ export const DaemonMode = {
 export interface DecoContext<TAppManifest extends AppManifest = AppManifest> {
   deploymentId: string | undefined;
   isDeploy: boolean;
+  isPreview: boolean;
   decodMode?: DecodMode;
   platform: WellKnownHostingPlatform;
   site: string;
@@ -86,6 +87,7 @@ export interface RequestContextBinder {
 }
 
 const deploymentId = Deno.env.get("DENO_DEPLOYMENT_ID");
+const isPreview = Deno.env.get("DECO_PREVIEW") === "true";
 const isDeploy = Boolean(deploymentId);
 
 const getHostingPlatform = (): WellKnownHostingPlatform => {
@@ -105,6 +107,7 @@ let defaultContext: Omit<DecoContext<any>, "schema"> = {
   deploymentId,
   siteId: 0,
   isDeploy: isDeploy,
+  isPreview,
   decodMode: Deno.env.get("DECOD_MODE") as DecodMode | undefined,
   platform: getHostingPlatform(),
   site: "",
