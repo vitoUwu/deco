@@ -72,6 +72,9 @@ export type DecoMiddlewareContext<
   I extends Input = {},
 > = HonoContext<DecoRouteState<TManifest>, P, I> & { render: ContextRenderer };
 
+const DISABLE_ROUTING_LOGGING =
+  Deno.env.get("DISABLE_ROUTING_LOGGING") === "true";
+
 export const createHandler = <TManifest extends AppManifest = AppManifest>(
   handler: DecoHandler<TManifest>,
 ): DecoHandler<TManifest> =>
@@ -191,7 +194,7 @@ const SERVER_TIMING_SEPARATOR: string = ",";
 /**
  * @description max length of server-timing header.
  */
-const SERVER_TIMING_MAX_LEN: number = 2_000;
+const SERVER_TIMING_MAX_LEN: number = 5_000;
 /**
  * @description return server-timing string equal or less than size parameter.
  * if timings.length > size then return the timing until the well-formed timing that's smaller than size.
@@ -320,7 +323,9 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
               );
             }
             span.end();
-            if (!url.pathname.startsWith("/_frsh")) {
+            if (
+              !url.pathname.startsWith("/_frsh") && !DISABLE_ROUTING_LOGGING
+            ) {
               console.info(
                 formatLog({
                   status: ctx.res?.status ?? 500,
