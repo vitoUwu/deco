@@ -12,7 +12,7 @@ import { minify as terserMinify } from "npm:terser@5.34.0";
 const verbose = !!Deno.env.get("SCRIPT_MINIFICATION_DEBUG");
 
 const cache = new LRUCache<string, string | Promise<string | null>>({
-  max: 500,
+  max: 1000,
 });
 
 const timings = (js: string) => {
