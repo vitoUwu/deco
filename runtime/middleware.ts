@@ -2,10 +2,15 @@
 import { HTTPException } from "@hono/hono/http-exception";
 import { DECO_MATCHER_HEADER_QS } from "../blocks/matcher.ts";
 import { Context, context } from "../deco.ts";
-import { type Exception, getCookies, SpanStatusCode } from "../deps.ts";
-import { withRequestContext } from "../observability/otel/context.ts";
+import {
+  type Exception,
+  getCookies,
+  getSetCookies,
+  SpanStatusCode,
+} from "../deps.ts";
 import { startObserve } from "../observability/http.ts";
 import { logger } from "../observability/mod.ts";
+import { withRequestContext } from "../observability/otel/context.ts";
 import { HttpError } from "../runtime/errors.ts";
 import type { AppManifest } from "../types.ts";
 import { isAdminOrLocalhost } from "../utils/admin.ts";
@@ -113,7 +118,7 @@ const addHours = function (date: Date, h: number) {
   return date;
 };
 
-export type DebugAction = (resp: Response) => void;
+export type DebugAction = (resp: Response) => void | Promise<void>;
 export const DEBUG = {
   none: (_resp: Response) => {},
   enable: (resp: Response) => {
@@ -149,12 +154,16 @@ export const DEBUG = {
     return {
       action: hasDebugFromQS || isLivePreview
         ? (enabled
-          ? (resp) => {
+          ? async (resp) => {
             DEBUG.enable(resp);
             resp.headers.set("x-correlation-id", correlationId);
             resp.headers.set(
               "x-deno-os-uptime-seconds",
               `${Deno.osUptime()}`,
+            );
+            resp.headers.set(
+              "x-deco-revision",
+              `${await liveContext.release?.revision() ?? ""}`,
             );
             resp.headers.set(
               "x-isolate-started-at",
@@ -261,7 +270,7 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
       if (ctx.req.raw.headers.get("upgrade") === "websocket") {
         return;
       }
-      ctx.res && action(ctx.res);
+      ctx.res && await action(ctx.res);
       setLogger(null);
     },
     // 2 => observability
@@ -451,6 +460,11 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
             sameSite: "Lax",
           }, { encode: true });
         }
+      }
+
+      // If response has set-cookie header, set cache-control to no-store
+      if (getSetCookies(newHeaders).length > 0) {
+        newHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
       }
 
       // for some reason hono deletes content-type when response is not fresh.

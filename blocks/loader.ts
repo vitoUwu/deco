@@ -139,7 +139,7 @@ export const wrapCaughtErrors = async <
 const stats = {
   cache: meter.createCounter("loader_cache", {
     unit: "1",
-    valueType: ValueType.INT,
+    valueType: ValueType.DOUBLE,
   }),
   latency: meter.createHistogram("resolver_latency", {
     description: "resolver latency",
@@ -155,6 +155,8 @@ caches?.open("loader")
   .catch(() => maybeCache = undefined);
 
 const MAX_AGE_S = parseInt(Deno.env.get("CACHE_MAX_AGE_S") ?? "60"); // 60 seconds
+const CACHE_SINGLEFLIGHT_DISABLED =
+  Deno.env.get("CACHE_SINGLEFLIGHT_DISABLED") === "true";
 
 // Reuse TextEncoder instance to avoid repeated instantiation
 const textEncoder = new TextEncoder();
@@ -262,33 +264,29 @@ const wrapLoader = (
 
         const resolveChainString = FieldResolver.minify(resolveChain)
           .toString();
-        const revisionID = await release?.revision() ?? undefined;
 
-        if (!resolveChainString || !revisionID) {
-          if (!resolveChainString && !revisionID) {
-            logger.warn(`Could not get revisionID nor resolveChain`);
-          }
-          if (!revisionID) {
-            logger.warn(
-              `Could not get revisionID for resolveChain ${resolveChainString}`,
-            );
-          }
-          if (!resolveChainString) {
-            logger.warn(
-              `Could not get resolveChain for revisionID ${revisionID}`,
-            );
-          }
+        if (!resolveChainString) {
+          logger.warn(`Could not get resolveChain`);
+          timing?.end();
+          return await handler(props, req, ctx);
+        }
 
+        // K_REVISION is preferred over the revisionID from the release
+        // because it does not change when only .decofile changes
+        const revisionID = Deno.env.get("K_REVISION") ??
+          (await release?.revision() ?? undefined);
+
+        if (!revisionID) {
+          logger.warn(`Could not get K_REVISION`);
           timing?.end();
           return await handler(props, req, ctx);
         }
 
         timing?.end();
 
-        // Optimize cache key generation using simple string concatenation
         const cacheKeyUrl = `https://localhost/?resolver=${
           encodeURIComponent(loader)
-        }&resolveChain=${encodeURIComponent(resolveChainString)}&revisionID=${
+        }&resolveChain=${encodeURIComponent(resolveChainString)}&revision=${
           encodeURIComponent(revisionID)
         }&cacheKey=${encodeURIComponent(cacheKeyValue)}`;
         const request = new Request(cacheKeyUrl);
@@ -382,6 +380,9 @@ const wrapLoader = (
           }
         };
 
+        if (CACHE_SINGLEFLIGHT_DISABLED) {
+          return await staleWhileRevalidate();
+        }
         return await flights.do(request.url, staleWhileRevalidate);
       } finally {
         const dimension = { loader, status };
