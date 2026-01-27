@@ -57,16 +57,19 @@ const _minify = async (js: string) => {
  * @param {string} code - The javascript code to minify.
  * @returns The minified code.
  */
-export const minify = async (code: string) => {
+export const minify = (code: string) => {
   const cached = cache.get(code) || _minify(code);
 
   if (typeof cached === "object") {
-    const resolved = await cached;
-    if (resolved === null) {
-      cache.delete(code);
-    } else {
-      cache.set(code, resolved);
-    }
+    cache.set(code, cached);
+
+    cached.then((minified) => {
+      if (minified === null) {
+        cache.delete(code);
+      } else {
+        cache.set(code, minified);
+      }
+    });
   }
 
   const minified = typeof cached === "string" ? cached : code;
@@ -87,22 +90,7 @@ export function useScript<T extends (...args: any[]) => any>(
   ...params: Parameters<T>
 ): string {
   const javascript = fn.toString();
-  const cached = cache.get(javascript) || _minify(javascript);
-
-  if (typeof cached === "object") {
-    cache.set(javascript, cached);
-
-    cached.then((minified) => {
-      if (minified === null) {
-        cache.delete(javascript);
-      } else {
-        cache.set(javascript, minified);
-      }
-    });
-  }
-
-  const minified = typeof cached === "string" ? cached : javascript;
-
+  const minified = minify(javascript);
   return `(${minified})(${params.map((p) => JSON.stringify(p)).join(", ")})`;
 }
 
