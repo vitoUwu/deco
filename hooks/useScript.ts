@@ -28,7 +28,7 @@ const timings = (js: string) => {
   };
 };
 
-const minify = async (js: string) => {
+const _minify = async (js: string) => {
   try {
     const log = verbose ? timings(js) : null;
 
@@ -52,6 +52,29 @@ const minify = async (js: string) => {
 };
 
 /**
+ * Minifies the given javascript code.
+ *
+ * @param {string} code - The javascript code to minify.
+ * @returns The minified code.
+ */
+export const minify = async (code: string) => {
+  const cached = cache.get(code) || _minify(code);
+
+  if (typeof cached === "object") {
+    const resolved = await cached;
+    if (resolved === null) {
+      cache.delete(code);
+    } else {
+      cache.set(code, resolved);
+    }
+  }
+
+  const minified = typeof cached === "string" ? cached : code;
+
+  return minified;
+};
+
+/**
  * Hook to create a minified script tag from a function.
  *
  * @template T - Type of the function to be used as script
@@ -64,7 +87,7 @@ export function useScript<T extends (...args: any[]) => any>(
   ...params: Parameters<T>
 ): string {
   const javascript = fn.toString();
-  const cached = cache.get(javascript) || minify(javascript);
+  const cached = cache.get(javascript) || _minify(javascript);
 
   if (typeof cached === "object") {
     cache.set(javascript, cached);
