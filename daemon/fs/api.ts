@@ -105,7 +105,9 @@ export interface GrepAPI {
 const shouldIgnore = (path: string) =>
   basename(path) !== ".gitignore" &&
     path.includes(`${SEPARATOR}.git`) ||
-  path.includes(`${SEPARATOR}node_modules${SEPARATOR}`);
+  path.includes(`${SEPARATOR}node_modules${SEPARATOR}`) ||
+  path.includes(`${SEPARATOR}.agent-home${SEPARATOR}`) ||
+  path.includes(`${SEPARATOR}.claude${SEPARATOR}`);
 
 const systemPathFromBrowser = (pathAndQuery: string) => {
   const [url] = pathAndQuery.split("?");
@@ -154,10 +156,13 @@ export async function* start(since: number): AsyncIterableIterator<FSEvent> {
   }
 }
 
-export const watchFS = async () => {
+export const watchFS = async (signal?: AbortSignal) => {
+  if (signal?.aborted) return;
   const watcher = Deno.watchFs(Deno.cwd(), { recursive: true });
+  signal?.addEventListener("abort", () => watcher.close(), { once: true });
 
   for await (const { kind, paths } of watcher) {
+    if (signal?.aborted) break;
     if (kind !== "create" && kind !== "remove" && kind !== "modify") {
       continue;
     }

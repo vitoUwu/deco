@@ -13,19 +13,28 @@ import {
 import { genMetadata } from "../engine/decofile/fsFolder.ts";
 import { bundleApp } from "../scripts/apps/bundle.lib.ts";
 import { delay, throttle } from "../utils/async.ts";
+import { createAuth } from "./auth.ts";
 import {
   createDaemonAPIs,
   DECO_ENV_NAME,
   DECO_HOST,
-  DECO_SITE_NAME,
+  getSiteName,
+  SANDBOX_MODE,
 } from "./daemon.ts";
 import { watchFS } from "./fs/api.ts";
 import { ensureGit, getGitHubPackageTokens, lockerGitAPI } from "./git.ts";
 import { logs } from "./loggings/stream.ts";
 import { watchMeta } from "./meta.ts";
-import { activityMonitor, createIdleHandler } from "./monitor.ts";
-import { register } from "./tunnel.ts";
-import { createWorker, type WorkerOptions } from "./worker.ts";
+import {
+  activityMonitor,
+  createIdleHandler,
+  resetActivity,
+} from "./monitor.ts";
+import { downloadCache } from "./cache.ts";
+import { createAIHandlers } from "./ai/handlers.ts";
+import { createSandboxHandlers, type DeployParams } from "./sandbox.ts";
+import { register, type TunnelConnection } from "./tunnel.ts";
+import { createWorker, worker, type WorkerOptions } from "./worker.ts";
 import { portPool } from "./workers/portpool.ts";
 
 const parsedArgs = parseArgs(Deno.args, {
@@ -70,53 +79,75 @@ const buildCmd = buildCmdStr
 const getEnvVar = (envName: string, varName: string) =>
   Deno.env.get(envName) ? { [varName]: Deno.env.get(envName) } : {};
 
-const createRunCmd = cmd
-  ? (opt?: Pick<Deno.CommandOptions, "env">) =>
-    new Deno.Command(cmd === "deno" ? Deno.execPath() : cmd, {
-      args,
-      stdout: "piped",
-      stderr: "piped",
-      env: {
-        ...opt?.env,
-        PORT: `${WORKER_PORT}`,
-        ...getEnvVar(DENO_AUTH_TOKENS, DENO_AUTH_TOKENS),
-        ...getEnvVar("DENO_DIR_RUN", "DENO_DIR"),
-      },
-    })
+type RunCmdFactory = (opt?: Pick<Deno.CommandOptions, "env">) => Deno.Command;
+
+const makeRunCmdFactory = (
+  runCmd: string,
+  runArgs: string[],
+  extraEnv?: Record<string, string>,
+): RunCmdFactory =>
+(opt?: Pick<Deno.CommandOptions, "env">) =>
+  new Deno.Command(runCmd === "deno" ? Deno.execPath() : runCmd, {
+    args: runArgs,
+    stdout: "piped",
+    stderr: "piped",
+    env: {
+      ...extraEnv,
+      ...opt?.env,
+      PORT: `${WORKER_PORT}`,
+      ...getEnvVar(DENO_AUTH_TOKENS, DENO_AUTH_TOKENS),
+      ...getEnvVar("DENO_DIR_RUN", "DENO_DIR"),
+    },
+  });
+
+const createRunCmd: RunCmdFactory | null = cmd
+  ? makeRunCmdFactory(cmd, args)
   : null;
 
 let lastUpdateEnvUpdate: number | undefined;
 const updateDenoAuthTokenEnv = async () => {
   if (
     !UNSTABLE_WORKER_RESPAWN_INTERVAL_MS ||
-    lastUpdateEnvUpdate &&
-      Date.now() < lastUpdateEnvUpdate
-  ) return;
+    (lastUpdateEnvUpdate && Date.now() < lastUpdateEnvUpdate)
+  ) {
+    return;
+  }
   lastUpdateEnvUpdate = Date.now() + UNSTABLE_WORKER_RESPAWN_INTERVAL_MS;
 
   const appTokens = await getGitHubPackageTokens();
   // TODO: handle if DENO_AUTH_TOKENS is already set
   Deno.env.set(
     DENO_AUTH_TOKENS,
-    appTokens.map((token) => `${token}@raw.githubusercontent.com`).join(
-      ";",
-    ),
+    appTokens.map((token) => `${token}@raw.githubusercontent.com`).join(";"),
   );
 };
 
-if (!DECO_SITE_NAME) {
+if (SANDBOX_MODE && getSiteName()) {
   console.error(
-    `site name not found. use ${ENV_SITE_NAME} environment variable to set it.`,
+    `[sandbox] SANDBOX_MODE=true but ${ENV_SITE_NAME} is already set. These are mutually exclusive.`,
   );
   Deno.exit(1);
 }
 
-globalThis.addEventListener("unhandledrejection", (e: {
-  promise: Promise<unknown>;
-  reason: unknown;
-}) => {
-  console.log("unhandled rejection at:", e.promise, "reason:", e.reason);
-});
+if (!SANDBOX_MODE && !getSiteName()) {
+  console.error(
+    `site name not found. use ${ENV_SITE_NAME} environment variable to set it, or set SANDBOX_MODE=true.`,
+  );
+  Deno.exit(1);
+}
+
+if (SANDBOX_MODE) {
+  console.log(
+    `[sandbox] Starting in sandbox mode. Use POST /sandbox/deploy to assign a site.`,
+  );
+}
+
+globalThis.addEventListener(
+  "unhandledrejection",
+  (e: { promise: Promise<unknown>; reason: unknown }) => {
+    console.log("unhandled rejection at:", e.promise, "reason:", e.reason);
+  },
+);
 
 const createBundler = (appName?: string) => {
   const bundler = bundleApp(Deno.cwd());
@@ -176,13 +207,19 @@ const persistState = throttle(async () => {
 
 // Watch for changes in filesystem
 // TODO: we should be able to completely remove this after in some point in the future
-const watch = async () => {
+const watch = async (signal?: AbortSignal) => {
+  if (signal?.aborted) return;
   const watcher = Deno.watchFs(Deno.cwd(), { recursive: true });
+  signal?.addEventListener("abort", () => watcher.close(), { once: true });
 
   for await (const event of watcher) {
+    if (signal?.aborted) break;
+
     using _ = await lockerGitAPI.lock.rlock();
-    const skip = event.paths.some((path) =>
-      path.includes(".git") || path.includes("node_modules")
+    const skip = event.paths.some(
+      (path) =>
+        path.includes(".git") || path.includes("node_modules") ||
+        path.includes(".agent-home") || path.includes(".claude"),
     );
 
     if (skip) {
@@ -204,9 +241,10 @@ const watch = async () => {
 
     /** We should move this to the new FS api */
     const codeCreatedOrDeleted = event.kind !== "modify" &&
-      event.kind !== "access" && event.paths.some((path) => (
-        /\.tsx?$/.test(path) && !path.includes("manifest.gen.ts")
-      ));
+      event.kind !== "access" &&
+      event.paths.some(
+        (path) => /\.tsx?$/.test(path) && !path.includes("manifest.gen.ts"),
+      );
 
     if (codeCreatedOrDeleted) {
       genManifestTS();
@@ -221,25 +259,53 @@ const watch = async () => {
   }
 };
 
-const createDeps = (): MiddlewareHandler => {
+const createDeps = (
+  signal?: AbortSignal,
+  opts?: { repoUrl?: string; branch?: string },
+): MiddlewareHandler => {
   let ok: Promise<unknown> | null | false = null;
 
   const start = async () => {
+    const siteName = getSiteName();
+    if (!siteName) {
+      throw new Error("Cannot initialize deps: site name not set");
+    }
     let start = performance.now();
-    await ensureGit({ site: DECO_SITE_NAME! });
+    await ensureGit({
+      site: siteName,
+      repoUrl: opts?.repoUrl,
+      branch: opts?.branch,
+    });
     logs.push({
       level: "info",
       message: `${colors.bold("[step 1/4]")}: Git setup took ${
-        (performance.now() - start).toFixed(0)
+        (
+          performance.now() - start
+        ).toFixed(0)
       }ms`,
     });
+
+    if (SANDBOX_MODE) {
+      start = performance.now();
+      await downloadCache(siteName).catch((err) => {
+        console.warn(`[cache] Failed to download build cache: ${err.message}`);
+      });
+      logs.push({
+        level: "info",
+        message: `${colors.bold("[step 1.5/4]")}: Cache download took ${
+          (performance.now() - start).toFixed(0)
+        }ms`,
+      });
+    }
 
     start = performance.now();
     await genManifestTS();
     logs.push({
       level: "info",
       message: `${colors.bold("[step 2/4]")}: Manifest generation took ${
-        (performance.now() - start).toFixed(0)
+        (
+          performance.now() - start
+        ).toFixed(0)
       }ms`,
     });
 
@@ -248,18 +314,22 @@ const createDeps = (): MiddlewareHandler => {
     logs.push({
       level: "info",
       message: `${colors.bold("[step 3/4]")}: Blocks metadata generation took ${
-        (performance.now() - start).toFixed(0)
+        (
+          performance.now() - start
+        ).toFixed(0)
       }ms`,
     });
 
-    watch().catch(console.error);
-    watchMeta().catch(console.error);
-    watchFS().catch(console.error);
+    watch(signal).catch(console.error);
+    watchMeta(signal).catch(console.error);
+    watchFS(signal).catch(console.error);
 
     logs.push({
       level: "info",
       message: `${
-        colors.bold("[step 4/4]")
+        colors.bold(
+          "[step 4/4]",
+        )
       }: Started file watcher in background`,
     });
   };
@@ -275,6 +345,133 @@ const createDeps = (): MiddlewareHandler => {
       c.res = new Response("Error while starting global deps", { status: 424 });
     }
   };
+};
+
+// Create a function that returns fresh WorkerOptions with new tokens
+const makeWorkerOptionsFactory =
+  (runCmdFactory: RunCmdFactory) => async (): Promise<WorkerOptions> => {
+    if (HAS_PRIVATE_GITHUB_IMPORT) {
+      await updateDenoAuthTokenEnv();
+    }
+
+    if (UNSTABLE_WORKER_RESPAWN_INTERVAL_MS) {
+      /* TODO: Implement a better approach handling updating child env vars, preventing multiple child processes and with HMR.
+			 * Also should have the git short live auth token to do git operations like: push/pull/rebase. Now, these git operations are guaranted
+			 * because the short live git token is set once in inicialization and respawning
+			 */
+      // Kill process to allow restart with new env settings
+      setTimeout(() => {
+        Deno.exit(1);
+      }, UNSTABLE_WORKER_RESPAWN_INTERVAL_MS);
+    }
+
+    return {
+      command: runCmdFactory(), // This will create a fresh command with new tokens
+      port: WORKER_PORT,
+      persist,
+    };
+  };
+
+interface SiteAppOptions {
+  siteName: string;
+  runCmdFactory?: RunCmdFactory | null;
+  repoUrl?: string;
+  branch?: string;
+}
+
+interface SiteAppResult {
+  app: Hono;
+  dispose: () => Promise<void>;
+}
+
+/**
+ * Creates a Hono sub-app with all site-specific middleware:
+ * idle handler, deps (git, manifests, watchers), activity monitor,
+ * daemon APIs, and worker proxy.
+ *
+ * Returns the app and a dispose function to clean up on undeploy.
+ */
+const createSiteApp = ({
+  siteName,
+  runCmdFactory,
+  repoUrl,
+  branch,
+}: SiteAppOptions): SiteAppResult => {
+  const ac = new AbortController();
+  const siteApp = new Hono();
+  // idle should run even when branch is not active
+  // When DECO_ENV_NAME is unset, idle reporting is disabled by createIdleHandler
+  const envName = DECO_ENV_NAME ?? "";
+  siteApp.get("/deco/_is_idle", createIdleHandler(siteName, envName));
+  // Globals are started after healthcheck to ensure k8s does not kill the pod before it is ready
+  siteApp.use(createDeps(ac.signal, { repoUrl, branch }));
+  siteApp.use(activityMonitor);
+  // These are the APIs that communicate with admin UI
+  siteApp.use(createDaemonAPIs({ build: buildCmd, site: siteName }));
+  // Workers are only necessary if there needs to have a preview of the site
+  if (runCmdFactory) {
+    siteApp.route("", createWorker(makeWorkerOptionsFactory(runCmdFactory)));
+  }
+
+  const dispose = async () => {
+    // 1. Stop the worker subprocess
+    try {
+      const w = await Promise.race([
+        worker().then((w) => w),
+        new Promise<null>((r) => setTimeout(() => r(null), 1000)),
+      ]);
+      if (w) {
+        await w[Symbol.asyncDispose]();
+        console.log(`[sandbox] Worker subprocess stopped`);
+      }
+    } catch {
+      // Worker may not have been started
+    }
+
+    // 2. Stop all file watchers (prevents manifest gen / HMR triggers)
+    ac.abort();
+    console.log(`[sandbox] Watchers stopped`);
+
+    // 3. Clean all files in cwd (the cloned site repo)
+    const cwd = Deno.cwd();
+    for await (const entry of Deno.readDir(cwd)) {
+      const path = join(cwd, entry.name);
+      await Deno.remove(path, { recursive: true }).catch(() => {});
+    }
+    console.log(`[sandbox] Cleaned working directory: ${cwd}`);
+  };
+
+  return { app: siteApp, dispose };
+};
+const LOCAL_STORAGE_ENV_NAME = "deco_host_env_name";
+const stableEnvironmentName = () => {
+  const savedEnvironment = localStorage.getItem(LOCAL_STORAGE_ENV_NAME);
+  if (savedEnvironment) {
+    return savedEnvironment;
+  }
+
+  const newEnvironment = `${crypto.randomUUID().slice(0, 6)}-localhost`;
+  localStorage.setItem(LOCAL_STORAGE_ENV_NAME, newEnvironment);
+  return newEnvironment;
+};
+
+const port = Number(Deno.env.get("APP_PORT")) || 8000;
+
+const registerTunnel = async (
+  siteName: string,
+  envNameOverride?: string,
+): Promise<TunnelConnection | null> => {
+  const env = envNameOverride ??
+    (DECO_HOST && !DECO_ENV_NAME ? stableEnvironmentName() : DECO_ENV_NAME);
+  if (env && !Deno.env.has("DECO_PREVIEW")) {
+    return await register({
+      site: siteName,
+      env,
+      port: `${port}`,
+      decoHost: DECO_HOST,
+    });
+  }
+  return null;
 };
 
 const app = new Hono();
@@ -300,80 +497,260 @@ app.get("/_healthcheck", (c) => {
     },
   });
 });
-// idle should run even when branch is not active
-app.get("/deco/_is_idle", createIdleHandler(DECO_SITE_NAME!, DECO_ENV_NAME!));
 // k8s liveness probe
 app.get("/deco/_liveness", () => new Response("OK", { status: 200 }));
 
-// Globals are started after healthcheck to ensure k8s does not kill the pod before it is ready
-app.use(createDeps());
-app.use(activityMonitor);
-// These are the APIs that communicate with admin UI
-app.use(createDaemonAPIs({ build: buildCmd, site: DECO_SITE_NAME }));
-// Workers are only necessary if there needs to have a preview of the site
-if (createRunCmd) {
-  // Create a function that returns fresh WorkerOptions with new tokens
-  const createWorkerOptions = async (): Promise<WorkerOptions> => {
-    if (HAS_PRIVATE_GITHUB_IMPORT) {
-      await updateDenoAuthTokenEnv();
-    }
+if (SANDBOX_MODE) {
+  // Sandbox mode: start without a site, deploy later via POST /sandbox/deploy
+  let currentSite: SiteAppResult | null = null;
+  let tunnelConn: TunnelConnection | null = null;
+  let aiHandlers: ReturnType<typeof createAIHandlers> | null = null;
 
-    if (UNSTABLE_WORKER_RESPAWN_INTERVAL_MS) {
-      /* TODO: Implement a better approach handling updating child env vars, preventing multiple child processes and with HMR.
-       * Also should have the git short live auth token to do git operations like: push/pull/rebase. Now, these git operations are guaranted
-       * because the short live git token is set once in inicialization and respawning
-       */
-      // Kill process to allow restart with new env settings
-      setTimeout(() => {
-        Deno.exit(1);
-      }, UNSTABLE_WORKER_RESPAWN_INTERVAL_MS);
-    }
+  const sandbox = createSandboxHandlers({
+    onDeploy: async (
+      { repo, site, envName, branch, runCommand, envs, task }: DeployParams,
+    ) => {
+      // Reset idle timer so the newly claimed sandbox starts fresh
+      resetActivity();
+      // Set env var so worker subprocesses inherit the site name
+      Deno.env.set(ENV_SITE_NAME, site);
 
-    return {
-      command: createRunCmd(), // This will create a fresh command with new tokens
-      port: WORKER_PORT,
-      persist,
-    };
+      // Use run command from deploy request, fall back to CLI args
+      const runCmdFactory = runCommand?.length
+        ? makeRunCmdFactory(runCommand[0], runCommand.slice(1), envs)
+        : createRunCmd;
+
+      currentSite = createSiteApp({
+        siteName: site,
+        runCmdFactory,
+        repoUrl: repo,
+        branch,
+      });
+
+      // Create AI handlers if ANTHROPIC_API_KEY is available
+      const apiKey = Deno.env.get("ANTHROPIC_API_KEY");
+      if (apiKey) {
+        aiHandlers = createAIHandlers({
+          cwd: Deno.cwd(),
+          apiKey,
+          githubToken: Deno.env.get("GITHUB_TOKEN"),
+          extraEnv: envs,
+        });
+      }
+
+      const tunnel = await registerTunnel(site, envName).catch((err) => {
+        console.error("Tunnel registration failed:", err);
+        return null;
+      });
+
+      tunnelConn = tunnel;
+
+      // Auto-create an AI task if task field was provided in deploy request
+      // apiKey is guaranteed non-null when aiHandlers is truthy
+      if (
+        task && aiHandlers && apiKey && (task.issue || task.prompt)
+      ) {
+        const handlers = aiHandlers;
+        // Wait for git clone to finish before starting the AI task,
+        // since the task needs a valid repo (git rev-parse HEAD, etc.)
+        ensureGit({ site, repoUrl: repo, branch }).then(async () => {
+          const ct = await handlers.createTask({
+            issue: task.issue,
+            prompt: task.prompt,
+          });
+          console.log(
+            `[sandbox] Auto-started AI task ${ct.taskId}${
+              task.issue ? ` for issue: ${task.issue}` : ""
+            }`,
+          );
+        }).catch((err) => {
+          console.error(`[sandbox] Auto-start AI task failed:`, err);
+        });
+      }
+
+      return { domain: tunnel?.domain };
+    },
+    onUndeploy: async () => {
+      // Dispose AI handlers first (kills running tasks)
+      if (aiHandlers) {
+        await aiHandlers.dispose();
+        aiHandlers = null;
+        console.log(`[sandbox] AI handlers disposed`);
+      }
+      if (currentSite) {
+        await currentSite.dispose();
+        currentSite = null;
+      }
+      if (tunnelConn) {
+        tunnelConn.close();
+        tunnelConn = null;
+        console.log(`[sandbox] Tunnel closed`);
+      }
+      Deno.env.delete(ENV_SITE_NAME);
+    },
+  });
+
+  app.get("/sandbox/status", sandbox.status);
+  app.post("/sandbox/deploy", sandbox.deploy);
+  app.delete("/sandbox/deploy", sandbox.undeploy);
+
+  // AI task endpoints (auth-protected, proxied to AI sub-app)
+  const aiAuth: MiddlewareHandler = async (c, next) => {
+    const site = getSiteName();
+    if (!site) {
+      return c.json({ error: "Not deployed" }, 503);
+    }
+    if (!aiHandlers) {
+      return c.json(
+        {
+          error: "AI integration not available (ANTHROPIC_API_KEY not set)",
+        },
+        503,
+      );
+    }
+    await createAuth({ site })(c, next);
   };
 
-  app.route("", createWorker(createWorkerOptions));
-}
-
-const LOCAL_STORAGE_ENV_NAME = "deco_host_env_name";
-const stableEnvironmentName = () => {
-  const savedEnvironment = localStorage.getItem(LOCAL_STORAGE_ENV_NAME);
-  if (savedEnvironment) {
-    return savedEnvironment;
+  for (const pattern of ["/sandbox/tasks", "/sandbox/tasks/*"] as const) {
+    app.use(pattern, aiAuth);
   }
 
-  const newEnvironment = `${crypto.randomUUID().slice(0, 6)}-localhost`;
-  localStorage.setItem(LOCAL_STORAGE_ENV_NAME, newEnvironment);
-  return newEnvironment;
-};
-const port = Number(Deno.env.get("APP_PORT")) || 8000;
-Deno.serve({
-  port,
-  onListen: async (addr) => {
-    try {
-      const env = DECO_HOST && !DECO_ENV_NAME
-        ? stableEnvironmentName()
-        : DECO_ENV_NAME;
-      if (env && DECO_SITE_NAME && !Deno.env.has("DECO_PREVIEW")) {
-        await register({
-          site: DECO_SITE_NAME,
-          env,
-          port: `${port}`,
-          decoHost: DECO_HOST,
-        });
-      } else {
-        console.log(
-          colors.green(
-            `Server running on http://${addr.hostname}:${addr.port}`,
-          ),
-        );
-      }
-    } catch (err) {
-      console.log(err);
+  // WebSocket upgrade must be handled directly (not proxied through sub-app)
+  // because Deno.upgradeWebSocket requires the original server request object.
+  app.get("/sandbox/tasks/:taskId/ws", (c) => {
+    if (!aiHandlers) {
+      return c.json({ error: "Not available" }, 503);
     }
+    const task = aiHandlers.getTask(c.req.param("taskId"));
+    if (!task) {
+      return c.json({ error: "Task not found" }, 404);
+    }
+    const session = task.session;
+    if (!session) {
+      return c.json({ error: "Task has no active session" }, 400);
+    }
+
+    const { socket, response } = Deno.upgradeWebSocket(c.req.raw);
+
+    let unsubData: (() => void) | undefined;
+    let unsubExit: (() => void) | undefined;
+
+    socket.onopen = () => {
+      for (const line of session.outputBuffer) {
+        socket.send(line);
+      }
+      if (session.status === "exited") {
+        socket.send(JSON.stringify({ type: "exit", code: session.exitCode }));
+        // Delay close to let buffered data flush to the client
+        setTimeout(() => {
+          if (socket.readyState === WebSocket.OPEN) {
+            socket.close();
+          }
+        }, 500);
+        return;
+      }
+      unsubData = session.onData((data) => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(data);
+        }
+      });
+      unsubExit = session.onExit((code) => {
+        if (socket.readyState === WebSocket.OPEN) {
+          socket.send(JSON.stringify({ type: "exit", code }));
+          setTimeout(() => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.close();
+            }
+          }, 500);
+        }
+      });
+    };
+
+    socket.onmessage = (event) => {
+      try {
+        const msg = JSON.parse(event.data as string);
+        if (msg.type === "input" && typeof msg.data === "string") {
+          session.write(msg.data);
+        } else if (
+          msg.type === "resize" && typeof msg.cols === "number" &&
+          typeof msg.rows === "number"
+        ) {
+          session.resize(msg.cols, msg.rows);
+        }
+      } catch {
+        // Ignore malformed messages
+      }
+    };
+
+    socket.onclose = () => {
+      unsubData?.();
+      unsubExit?.();
+    };
+
+    return response;
+  });
+
+  // All other /sandbox/tasks routes → proxy to AI sub-app
+  for (
+    const pattern of ["/sandbox/tasks", "/sandbox/tasks/*"] as const
+  ) {
+    app.all(pattern, (c) => {
+      if (!aiHandlers) {
+        return c.json({ error: "Not available" }, 503);
+      }
+      const url = new URL(c.req.url);
+      url.pathname = url.pathname.replace(/^\/sandbox\/tasks/, "") || "/";
+      const rewritten = new Request(url.toString(), c.req.raw);
+      return aiHandlers.app.fetch(rewritten);
+    });
+  }
+
+  // Delegate all other requests to the site app once deployed, or return 503
+  app.all("*", (c) => {
+    if (!currentSite) {
+      return c.json(
+        {
+          error:
+            "Sandbox mode: not deployed yet. POST /sandbox/deploy to assign a site.",
+        },
+        503,
+      );
+    }
+    return currentSite.app.fetch(c.req.raw);
+  });
+} else {
+  // Normal mode: site is known at startup
+  const siteName = getSiteName();
+  if (!siteName) {
+    throw new Error("Site name is required");
+  }
+  const { app: siteAppRoutes } = createSiteApp({
+    siteName,
+    runCmdFactory: createRunCmd,
+  });
+  app.route("", siteAppRoutes);
+}
+
+Deno.serve(
+  {
+    port,
+    onListen: async (addr) => {
+      try {
+        const siteName = !SANDBOX_MODE ? getSiteName() : undefined;
+        const tunnel = siteName ? await registerTunnel(siteName) : null;
+
+        if (!tunnel) {
+          const prefix = SANDBOX_MODE ? "[sandbox] " : "";
+          console.log(
+            colors.green(
+              `${prefix}Server running on http://${addr.hostname}:${addr.port}`,
+            ),
+          );
+        }
+      } catch (err) {
+        console.log(err);
+      }
+    },
   },
-}, app.fetch);
+  app.fetch,
+);

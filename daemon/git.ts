@@ -9,7 +9,8 @@ import {
   type StatusResult,
 } from "simple-git";
 import { createLocker } from "./async.ts";
-import { DECO_SITE_NAME } from "./daemon.ts";
+import { getSiteName } from "./daemon.ts";
+import { GITHUB_APP_CONFIGURED, setupGitHubAppNetrc } from "./githubApp.ts";
 import { logs } from "./loggings/stream.ts";
 import { DENO_DEPLOYMENT_ID } from "./main.ts";
 
@@ -216,7 +217,7 @@ export const publish = ({ build }: Options): Handler => {
     const author = body.author || { name: "decobot", email: "capy@deco.cx" };
     const message = body.message || `New release by ${author.name}`;
 
-    if (GITHUB_APP_KEY) {
+    if (GITHUB_APP_CONFIGURED || GITHUB_APP_KEY) {
       await setupGithubTokenNetrc();
     }
 
@@ -382,9 +383,14 @@ export const getGitHubToken = async (): Promise<string | undefined> => {
     throw new Error("GITHUB_APP_KEY not set");
   }
 
+  const siteName = getSiteName();
+  if (!siteName) {
+    throw new Error("Site name not set");
+  }
+
   const response = await fetch(
     new URL(
-      `/live/invoke/deco-sites/admin/loaders/github/getAccessToken.ts?sitename=${DECO_SITE_NAME}`,
+      `/live/invoke/deco-sites/admin/loaders/github/getAccessToken.ts?sitename=${siteName}`,
       ADMIN_DOMAIN,
     ).href,
     {
@@ -416,9 +422,14 @@ export const getGitHubPackageTokens = async (): Promise<string[]> => {
     throw new Error("GITHUB_APP_KEY not set");
   }
 
+  const siteName = getSiteName();
+  if (!siteName) {
+    throw new Error("Site name not set");
+  }
+
   const response = await fetch(
     new URL(
-      `/live/invoke/deco-sites/admin/loaders/github/getPackagesAccessToken.ts?sitename=${DECO_SITE_NAME}`,
+      `/live/invoke/deco-sites/admin/loaders/github/getPackagesAccessToken.ts?sitename=${siteName}`,
       ADMIN_DOMAIN,
     ),
     {
@@ -445,7 +456,19 @@ export const getGitHubPackageTokens = async (): Promise<string[]> => {
   return packageTokens;
 };
 
-const setupGithubTokenNetrc = async (): Promise<void> => {
+export const setupGithubTokenNetrc = async (): Promise<void> => {
+  // Prefer direct GitHub App token generation (no admin API dependency)
+  if (GITHUB_APP_CONFIGURED) {
+    const owner = "deco-sites";
+    const siteName = getSiteName();
+    if (!siteName) {
+      throw new Error("Site name not set");
+    }
+    await setupGitHubAppNetrc(owner, siteName);
+    return;
+  }
+
+  // Fallback: fetch token via admin API
   const token = await getGitHubToken();
   if (token === undefined) return;
 
@@ -468,7 +491,9 @@ export const assertRebased = async (): Promise<void> => {
   if (status.conflicted.length > 0) {
     console.log(
       `Skipping rebase: Repository has existing conflicts: ${
-        status.conflicted.join(", ")
+        status.conflicted.join(
+          ", ",
+        )
       }`,
     );
     return;
@@ -533,7 +558,14 @@ export const assertRebased = async (): Promise<void> => {
   }
 };
 
-export const ensureGit = async ({ site }: Pick<Options, "site">) => {
+export const ensureGit = async ({
+  site,
+  repoUrl,
+  branch,
+}: Pick<Options, "site"> & {
+  repoUrl?: string;
+  branch?: string;
+}) => {
   const isDeployment = typeof DENO_DEPLOYMENT_ID === "string";
   const assertNoIndexLock = async () => {
     if (!isDeployment) {
@@ -591,7 +623,7 @@ export const ensureGit = async ({ site }: Pick<Options, "site">) => {
       );
     }
 
-    if (GITHUB_APP_KEY) {
+    if (GITHUB_APP_CONFIGURED || GITHUB_APP_KEY) {
       await setupGithubTokenNetrc();
     }
 
@@ -600,8 +632,10 @@ export const ensureGit = async ({ site }: Pick<Options, "site">) => {
       return;
     }
 
-    const cloneUrl = REPO_URL ??
-      (GITHUB_APP_KEY
+    const useHttps = GITHUB_APP_CONFIGURED || GITHUB_APP_KEY;
+    const cloneUrl = repoUrl ??
+      REPO_URL ??
+      (useHttps
         ? `https://github.com/deco-sites/${site}.git`
         : `git@github.com:deco-sites/${site}.git`);
 
@@ -611,10 +645,26 @@ export const ensureGit = async ({ site }: Pick<Options, "site">) => {
         "1",
         "--single-branch",
         "--branch",
-        DEFAULT_TRACKING_BRANCH,
+        branch ?? DEFAULT_TRACKING_BRANCH,
       ])
       .submoduleInit()
       .submoduleUpdate(["--depth", "1"]);
+
+    // Exclude AI agent artifacts from git tracking
+    const excludeFile = join(Deno.cwd(), ".git/info/exclude");
+    try {
+      const existing = await Deno.readTextFile(excludeFile).catch(() => "");
+      const entries = [".agent-home/", ".claude/"];
+      const toAdd = entries.filter((e) => !existing.includes(e));
+      if (toAdd.length > 0) {
+        await Deno.writeTextFile(
+          excludeFile,
+          existing.trimEnd() + "\n" + toAdd.join("\n") + "\n",
+        );
+      }
+    } catch {
+      // Ignore — exclude file may not exist yet
+    }
 
     // Copy build files if BUILD_FILES_DIR is specified
     if (BUILD_FILES_DIR) {
