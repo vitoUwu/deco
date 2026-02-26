@@ -40,11 +40,15 @@ export interface AITaskOptions {
   /** Working directory (the cloned repo). */
   cwd: string;
   /** AI provider API key — injected into the agent's env only. */
-  apiKey: string;
+  apiKey?: string;
   /** GITHUB_TOKEN — injected into the agent's and gh's env only. */
   githubToken?: string;
   /** Extra env vars for the agent process. */
   extraEnv?: Record<string, string>;
+  /** Admin proxy URL — when set (with proxyToken), routes API traffic through the proxy. */
+  proxyUrl?: string;
+  /** Scoped JWT token for authenticating with the admin proxy. */
+  proxyToken?: string;
 }
 
 export type AITaskStatus =
@@ -53,9 +57,12 @@ export type AITaskStatus =
   | "completed"
   | "failed";
 
+export type AITaskType = "interactive" | "prompt" | "issue";
+
 export interface AITaskInfo {
   taskId: string;
   status: AITaskStatus;
+  type: AITaskType;
   issue?: string;
   prompt?: string;
   prUrl?: string | null;
@@ -112,6 +119,7 @@ export class AITask {
   readonly createdAt: number;
   readonly issue?: string;
   readonly prompt?: string;
+  readonly type: AITaskType;
 
   #session: PtySession | null = null;
   #status: AITaskStatus = "pending";
@@ -136,6 +144,7 @@ export class AITask {
     this.createdAt = Date.now();
     this.issue = opts.issue;
     this.prompt = opts.prompt;
+    this.type = opts.issue ? "issue" : opts.prompt ? "prompt" : "interactive";
     this.#opts = opts;
   }
 
@@ -202,9 +211,24 @@ export class AITask {
     const realHome = Deno.env.get("HOME") ?? "/home/deno";
     const agentHome = `${this.#opts.cwd}/.agent-home`;
     Deno.mkdirSync(agentHome, { recursive: true });
+
+    // Pre-seed Claude config so it skips the interactive onboarding/login flow
+    const claudeConfig = `${agentHome}/.claude.json`;
+    try {
+      await Deno.stat(claudeConfig);
+    } catch {
+      await Deno.writeTextFile(
+        claudeConfig,
+        JSON.stringify({
+          hasCompletedOnboarding: true,
+          numStartups: 1,
+          firstStartTime: new Date().toISOString(),
+        }),
+      );
+    }
+
     const env: Record<string, string> = {
       ...this.#opts.extraEnv,
-      ANTHROPIC_API_KEY: this.#opts.apiKey,
       HOME: agentHome,
       PATH: [
         Deno.env.get("PATH") ?? "",
@@ -213,6 +237,14 @@ export class AITask {
         "/usr/local/bin",
       ].join(":"),
     };
+
+    if (this.#opts.proxyUrl && this.#opts.proxyToken) {
+      // Platform-provided key via proxy — real key never touches the sandbox
+      env.ANTHROPIC_BASE_URL = this.#opts.proxyUrl;
+      env.ANTHROPIC_API_KEY = this.#opts.proxyToken;
+    } else if (this.#opts.apiKey) {
+      env.ANTHROPIC_API_KEY = this.#opts.apiKey;
+    }
 
     if (HAS_GITHUB_AUTH && githubToken) {
       // File-based auth: write .netrc + gh config so both git and gh CLI
@@ -261,6 +293,8 @@ export class AITask {
         args: claudeArgs,
         env,
         cwd: this.#opts.cwd,
+        cols: 120,
+        rows: 40,
       });
 
       this.#session.onExit((code) => {
@@ -428,6 +462,7 @@ export class AITask {
     return {
       taskId: this.taskId,
       status: this.#status,
+      type: this.type,
       issue: this.issue,
       prompt: this.prompt,
       prUrl: this.#prUrl,

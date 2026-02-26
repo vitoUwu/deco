@@ -37,6 +37,10 @@ export interface ResolveOptions extends Opts {
   forceFresh?: boolean;
   propagateOptions?: boolean;
   resolveChain?: FieldResolver[];
+  /** @internal Pre-fetched state to avoid redundant async reads on inner resolves */
+  _cachedState?: ResolvableMap;
+  /** @internal Pre-fetched revision to avoid redundant async reads on inner resolves */
+  _cachedRevision?: string;
 }
 
 const withOverrides = (
@@ -78,6 +82,8 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
   protected danglingRecover?: Resolver;
   protected runOncePerRelease: Record<string, SyncOnce<any>>;
   private resolveHints: ResolveHints;
+  private _cachedResolvers: ResolverMap<BaseContext> | null = null;
+  private _resolveIdCounter = 0;
   constructor(
     config: ResolverOptions<TContext>,
     hints?: ResolveHints,
@@ -93,6 +99,7 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
       dispatchEvent(new Event("deco:hmr"));
       this.runOncePerRelease = {};
       this.resolveHints = {};
+      this._cachedResolvers = null;
     });
   }
 
@@ -115,7 +122,7 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
     );
 
   public getResolvers(): ResolverMap<BaseContext> {
-    return {
+    return this._cachedResolvers ??= {
       ...this.resolvers,
       resolve: function _resolve(obj: any, { resolve }: BaseContext) {
         return resolve(obj);
@@ -143,16 +150,28 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
     context: Omit<TContext, keyof BaseContext>,
     options?: ResolveOptions,
   ): Promise<T> => {
-    const [resolvables, revision] = await Promise.all([
-      this.release.state({
-        forceFresh: options?.forceFresh,
-      }),
-      this.release.revision(),
-    ]);
-    const nresolvables = withOverrides(options?.overrides, {
-      ...resolvables,
-      ...(this.resolvables ?? {}),
-    });
+    const hasCached = options?._cachedState !== undefined &&
+      options?._cachedRevision !== undefined;
+
+    let resolvables: ResolvableMap;
+    let revision: string;
+
+    if (hasCached && !options?.forceFresh) {
+      resolvables = options!._cachedState!;
+      revision = options!._cachedRevision!;
+    } else {
+      [resolvables, revision] = await Promise.all([
+        this.release.state({ forceFresh: options?.forceFresh }),
+        this.release.revision(),
+      ]);
+    }
+
+    const mergedResolvables = this.resolvables
+      ? { ...resolvables, ...this.resolvables }
+      : resolvables;
+    const nresolvables = options?.overrides
+      ? withOverrides(options.overrides, mergedResolvables)
+      : mergedResolvables;
     const resolvers = this.getResolvers();
     const currentOnce = this.runOncePerRelease;
     const resolveChain = options?.resolveChain ?? [];
@@ -161,7 +180,7 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
       danglingRecover: this.danglingRecover,
       resolve: _resolve as ResolveFunc,
       resolverId: "unknown",
-      resolveId: crypto.randomUUID(),
+      resolveId: `r${++this._resolveIdCounter}`,
       resolveChain,
       resolveHints: this.resolveHints,
       resolvables: nresolvables,
@@ -177,14 +196,16 @@ export class ReleaseResolver<TContext extends BaseContext = BaseContext> {
     const innerResolver = this.resolverFor(
       ctx,
       options
-        ? { // null if dangling, force fresh and propsAreResolved should not be reused across inner resolvables calls
+        ? {
           overrides: options?.overrides,
           monitoring: options?.monitoring,
+          _cachedState: resolvables,
+          _cachedRevision: revision,
           ...(options?.propagateOptions
             ? { nullIfDangling: options?.nullIfDangling, hooks: options?.hooks }
             : {}),
         }
-        : {},
+        : { _cachedState: resolvables, _cachedRevision: revision },
     );
     function _resolve<T>(
       typeOrResolvable: string | Resolvable<T>,

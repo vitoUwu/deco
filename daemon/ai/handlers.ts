@@ -4,12 +4,16 @@ import { AITask } from "./task.ts";
 interface AIHandlersOptions {
   /** Working directory for the AI agent (the cloned repo). */
   cwd: string;
-  /** AI provider API key from daemon env. */
-  apiKey: string;
+  /** AI provider API key from daemon env (optional — OAuth can be used instead). */
+  apiKey?: string;
   /** GITHUB_TOKEN from daemon env. */
   githubToken?: string;
   /** Extra env vars from deploy request. */
   extraEnv?: Record<string, string>;
+  /** Admin proxy URL — set at env level when "Use deco keys" is enabled. */
+  proxyUrl?: string;
+  /** Scoped JWT for authenticating with the admin proxy. */
+  proxyToken?: string;
 }
 
 export const createAIHandlers = (opts: AIHandlersOptions) => {
@@ -18,7 +22,10 @@ export const createAIHandlers = (opts: AIHandlersOptions) => {
 
   // POST /sandbox/tasks — create a new AI task
   app.post("/", async (c) => {
-    let body: { issue?: string; prompt?: string };
+    let body: {
+      issue?: string;
+      prompt?: string;
+    };
     try {
       body = await c.req.json();
     } catch {
@@ -49,6 +56,8 @@ export const createAIHandlers = (opts: AIHandlersOptions) => {
       apiKey: opts.apiKey,
       githubToken: opts.githubToken,
       extraEnv: opts.extraEnv,
+      proxyUrl: opts.proxyUrl,
+      proxyToken: opts.proxyToken,
     });
 
     tasks.set(task.taskId, task);
@@ -192,6 +201,8 @@ export const createAIHandlers = (opts: AIHandlersOptions) => {
       apiKey: opts.apiKey,
       githubToken: opts.githubToken,
       extraEnv: opts.extraEnv,
+      proxyUrl: opts.proxyUrl,
+      proxyToken: opts.proxyToken,
     });
     tasks.set(task.taskId, task);
     try {
