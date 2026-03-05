@@ -12,7 +12,7 @@ import { minify as terserMinify } from "npm:terser@5.34.0";
 const verbose = !!Deno.env.get("SCRIPT_MINIFICATION_DEBUG");
 
 const cache = new LRUCache<string, string | Promise<string | null>>({
-  max: 100,
+  max: 1000,
 });
 
 const timings = (js: string) => {
@@ -28,7 +28,7 @@ const timings = (js: string) => {
   };
 };
 
-const minify = async (js: string) => {
+const _minify = async (js: string) => {
   try {
     const log = verbose ? timings(js) : null;
 
@@ -52,6 +52,32 @@ const minify = async (js: string) => {
 };
 
 /**
+ * Minifies the given javascript code.
+ *
+ * @param {string} code - The javascript code to minify.
+ * @returns The minified code.
+ */
+export const minify = (code: string) => {
+  const cached = cache.get(code) || _minify(code);
+
+  if (typeof cached === "object") {
+    cache.set(code, cached);
+
+    cached.then((minified) => {
+      if (minified === null) {
+        cache.delete(code);
+      } else {
+        cache.set(code, minified);
+      }
+    });
+  }
+
+  const minified = typeof cached === "string" ? cached : code;
+
+  return minified;
+};
+
+/**
  * Hook to create a minified script tag from a function.
  *
  * @template T - Type of the function to be used as script
@@ -64,22 +90,7 @@ export function useScript<T extends (...args: any[]) => any>(
   ...params: Parameters<T>
 ): string {
   const javascript = fn.toString();
-  const cached = cache.get(javascript) || minify(javascript);
-
-  if (typeof cached === "object") {
-    cache.set(javascript, cached);
-
-    cached.then((minified) => {
-      if (minified === null) {
-        cache.delete(javascript);
-      } else {
-        cache.set(javascript, minified);
-      }
-    });
-  }
-
-  const minified = typeof cached === "string" ? cached : javascript;
-
+  const minified = minify(javascript);
   return `(${minified})(${params.map((p) => JSON.stringify(p)).join(", ")})`;
 }
 

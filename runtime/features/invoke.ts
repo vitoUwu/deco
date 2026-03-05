@@ -57,6 +57,21 @@ export const payloadToResolvable = (
     return payloadForFunc(p);
   }
 
+  // Prevent recursion on primitive values (strings, numbers, booleans, null, undefined)
+  if (typeof p !== "object" || p === null || Array.isArray(p)) {
+    throw new HttpError(
+      new Response(
+        `Invalid payload: expected object with InvokeFunction properties, got ${typeof p}`,
+        {
+          status: 400,
+          headers: {
+            "content-type": "text/plain",
+          },
+        },
+      ),
+    );
+  }
+
   const resolvable: Resolvable = {};
   for (const [prop, invoke] of Object.entries(p)) {
     resolvable[prop] = payloadToResolvable(invoke);
