@@ -27,7 +27,7 @@ import type { InvocationProxy } from "../utils/invoke.types.ts";
 import { type Device, deviceOf, isBot as isUABot } from "../utils/userAgent.ts";
 import type { HttpContext } from "./handler.ts";
 import type { Vary } from "../utils/vary.ts";
-import { Context } from "../mod.ts";
+import { Context } from "../deco.ts";
 import { simulateBot } from "../utils/http.ts";
 
 export interface GateKeeperAccess {
@@ -71,6 +71,23 @@ export const createBagKey = (description: string): symbol =>
   Symbol(description);
 
 /**
+ * Bag key for marking a page as dirty (not cacheable).
+ * App middlewares should set this in the bag when the page depends on cookies
+ * or other per-user state that prevents CDN caching.
+ */
+export const PAGE_DIRTY_KEY: symbol = createBagKey("page-dirty");
+
+/**
+ * Bag key for opting in to page-level CDN caching.
+ * App middlewares (e.g., VTEX) should set this when the page
+ * is safe to cache (anonymous segment, user not logged in, etc.).
+ * The runtime middleware only sets public Cache-Control if this key is present.
+ */
+export const PAGE_CACHE_ALLOWED_KEY: symbol = createBagKey(
+  "page-cache-allowed",
+);
+
+/**
  * Values that are fulfilled for every request
  */
 export interface RequestState {
@@ -81,6 +98,7 @@ export interface RequestState {
   };
   bag: WeakMap<any, any>;
   flags: Flag[];
+  dirty?: boolean;
 }
 
 export type FnContext<
