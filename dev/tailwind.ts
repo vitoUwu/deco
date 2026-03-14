@@ -65,15 +65,16 @@ const bundle = async (
     }`,
   );
 
-  return content.css;
+  return `/* mode:${mode} */\n${content.css}`;
 };
 
 const TAILWIND_FILE = "tailwind.css";
 
-const isDev = Deno.env.get("DECO_PREVIEW") ||
-  !Deno.env.has("DENO_DEPLOYMENT_ID");
+// const isDev = Deno.env.get("DECO_PREVIEW") ||
+//   !Deno.env.has("DENO_DEPLOYMENT_ID");
 
-const mode = isDev ? "dev" : "prod";
+// const mode = isDev ? "dev" : "prod";
+const mode = "prod";
 
 const withReleaseContent = async (config: Config) => {
   const allTsxFiles = new Map<string, string>();

@@ -3,7 +3,7 @@ export {
   setPartialTriggerMode,
   usePartialSection,
 } from "./usePartialSection.ts";
-export { useScript, useScriptAsDataURI } from "./useScript.ts";
+export { minify, useScript, useScriptAsDataURI } from "./useScript.ts";
 export {
   addAllowedQS,
   addBlockedQS,
