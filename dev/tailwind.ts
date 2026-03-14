@@ -65,7 +65,7 @@ const bundle = async (
     }`,
   );
 
-  return content.css;
+  return `/* mode:${mode} */\n${content.css}`;
 };
 
 const TAILWIND_FILE = "tailwind.css";
