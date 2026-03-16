@@ -27,7 +27,9 @@ export const wrapInvokeErr =
             code: "SWW",
           }),
           {
-            status: 500,
+            status: "status" in err && typeof err.status === "number"
+              ? err.status
+              : 500,
             headers: {
               "x-correlation-id": correlationId,
               "content-type": "application/json",
