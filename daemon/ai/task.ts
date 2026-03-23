@@ -1,5 +1,13 @@
-import { getGitHubToken, setupGithubTokenNetrc } from "../git.ts";
-import { GITHUB_APP_CONFIGURED, setupGitHubAppNetrc } from "../githubApp.ts";
+import { getGitHubToken, lockerGitAPI, setupGithubTokenNetrc } from "../git.ts";
+import {
+  AGENT_PERMISSIONS,
+  GITHUB_APP_CONFIGURED,
+  mintScopedToken,
+  resolveDefaultBranch,
+  setBranchProtection,
+  setupGitHubAppNetrc,
+} from "../githubApp.ts";
+import { resetActivity } from "../monitor.ts";
 import { PtySession } from "../pty/session.ts";
 import {
   buildPromptFromIssue,
@@ -49,6 +57,8 @@ export interface AITaskOptions {
   proxyUrl?: string;
   /** Scoped JWT token for authenticating with the admin proxy. */
   proxyToken?: string;
+  /** When true, commit any uncommitted changes after Claude exits. */
+  shouldCommitChanges?: boolean;
 }
 
 export type AITaskStatus =
@@ -66,13 +76,16 @@ export interface AITaskInfo {
   issue?: string;
   prompt?: string;
   prUrl?: string | null;
+  loginUrl?: string | null;
   createdAt: number;
 }
 
-/** Extract owner/repo from a git remote URL. */
+import { parseRepoUrl } from "./repoUrl.ts";
+
+/** Extract owner/repo/defaultBranch from the origin remote in a working tree. */
 async function getRepoInfo(
   cwd: string,
-): Promise<{ owner: string; repo: string }> {
+): Promise<{ owner: string; repo: string; defaultBranch: string | null }> {
   const cmd = new Deno.Command("git", {
     args: ["remote", "get-url", "origin"],
     cwd,
@@ -85,15 +98,34 @@ async function getRepoInfo(
     throw new Error(`git remote get-url origin failed: ${stderr}`);
   }
   const url = new TextDecoder().decode(output.stdout).trim();
+  const { owner, repo } = parseRepoUrl(url);
 
-  // Match: https://github.com/owner/repo.git OR git@github.com:owner/repo.git
-  const match = url.match(
-    /github\.com[:/]([^/]+)\/([^/.]+?)(?:\.git)?$/,
-  );
-  if (!match) {
-    throw new Error(`Cannot parse owner/repo from git remote: ${url}`);
+  let defaultBranch: string | null = null;
+  try {
+    const refCmd = new Deno.Command("git", {
+      args: ["symbolic-ref", "refs/remotes/origin/HEAD"],
+      cwd,
+      stdout: "piped",
+      stderr: "piped",
+    });
+    const refOutput = await refCmd.output();
+    if (refOutput.success) {
+      const ref = new TextDecoder().decode(refOutput.stdout).trim();
+      const branch = ref.replace(/^refs\/remotes\/origin\//, "");
+      if (branch) defaultBranch = branch;
+    }
+  } catch {
+    // symbolic-ref unavailable (shallow clone, missing remote HEAD, etc.)
   }
-  return { owner: match[1], repo: match[2] };
+
+  if (!defaultBranch) {
+    console.warn(
+      `[ai] Could not detect default branch for ${owner}/${repo} via git symbolic-ref; ` +
+        `will attempt GitHub API fallback before applying branch protection`,
+    );
+  }
+
+  return { owner, repo, defaultBranch };
 }
 
 /** Shared env for daemon-side git commands — includes HOME so git can find ~/.gitconfig and SSH keys. */
@@ -123,13 +155,19 @@ export class AITask {
 
   #session: PtySession | null = null;
   #status: AITaskStatus = "pending";
+  #disposed = false;
   #prUrl: string | null = null;
+  #loginUrl: string | null = null;
+  #stdoutBuffer = "";
   #issueCtx: IssueContext | null = null;
   #opts: AITaskOptions;
   #startSha: string | null = null;
   #githubToken: string | null = null;
   #tokenRefreshInterval: ReturnType<typeof setInterval> | null = null;
-  #repoInfo: { owner: string; repo: string } | null = null;
+  #activityInterval: ReturnType<typeof setInterval> | null = null;
+  #repoInfo:
+    | { owner: string; repo: string; defaultBranch: string | null }
+    | null = null;
 
   get status() {
     return this.#status;
@@ -169,12 +207,62 @@ export class AITask {
     // Self-provision a scoped GitHub token
     let githubToken = this.#opts.githubToken;
     if (!githubToken && GITHUB_APP_CONFIGURED) {
-      // New path: direct GitHub App token generation
+      // New path: two-token pattern — admin token for branch protection (discarded),
+      // restricted agent token for .agent-home (no administration permission)
       try {
         this.#repoInfo = await getRepoInfo(this.#opts.cwd);
-        githubToken = await setupGitHubAppNetrc(
+        // Daemon's own .netrc: full-permission token for git push in onComplete
+        await setupGitHubAppNetrc(
           this.#repoInfo.owner,
           this.#repoInfo.repo,
+        );
+
+        // Set branch protection with a short-lived admin token, then discard it
+        try {
+          const adminToken = await mintScopedToken(
+            this.#repoInfo.owner,
+            this.#repoInfo.repo,
+            { administration: "write", metadata: "read" },
+          );
+
+          let branch = this.#repoInfo.defaultBranch;
+          if (!branch) {
+            try {
+              branch = await resolveDefaultBranch(
+                this.#repoInfo.owner,
+                this.#repoInfo.repo,
+                adminToken,
+              );
+              this.#repoInfo.defaultBranch = branch;
+            } catch (apiErr) {
+              console.warn(
+                "[ai] GitHub API fallback for default branch failed:",
+                apiErr,
+              );
+            }
+          }
+
+          if (branch) {
+            await setBranchProtection(
+              this.#repoInfo.owner,
+              this.#repoInfo.repo,
+              branch,
+              adminToken,
+            );
+          } else {
+            console.warn(
+              "[ai] branch protection skipped: could not determine default branch",
+            );
+          }
+        } catch (err) {
+          console.warn("[ai] branch protection setup skipped:", err);
+        }
+
+        // Agent token: restricted — no administration permission
+        githubToken = await mintScopedToken(
+          this.#repoInfo.owner,
+          this.#repoInfo.repo,
+          { ...AGENT_PERMISSIONS },
         );
       } catch (err) {
         console.error(`[ai] Failed to provision GitHub token:`, err);
@@ -236,6 +324,10 @@ export class AITask {
         `${realHome}/.deno/bin`,
         "/usr/local/bin",
       ].join(":"),
+      // Prevent Claude Code from refusing to run inside another Claude Code
+      // session. The daemon may inherit this env var when started from a
+      // developer's terminal that already has Claude Code running.
+      CLAUDECODE: "",
     };
 
     if (this.#opts.proxyUrl && this.#opts.proxyToken) {
@@ -256,9 +348,16 @@ export class AITask {
         try {
           let newToken: string | undefined;
           if (GITHUB_APP_CONFIGURED && this.#repoInfo) {
-            newToken = await setupGitHubAppNetrc(
+            // Refresh daemon .netrc (full token)
+            await setupGitHubAppNetrc(
               this.#repoInfo.owner,
               this.#repoInfo.repo,
+            );
+            // Mint a fresh restricted token for the agent files
+            newToken = await mintScopedToken(
+              this.#repoInfo.owner,
+              this.#repoInfo.repo,
+              AGENT_PERMISSIONS,
             );
           } else if (GITHUB_APP_KEY) {
             await setupGithubTokenNetrc();
@@ -281,8 +380,6 @@ export class AITask {
       env.GITHUB_TOKEN = githubToken;
     }
 
-    // Interactive mode: just `claude` with no --print
-    // Task mode: `claude --print --dangerously-skip-permissions <prompt>`
     const claudeArgs = taskPrompt
       ? ["--print", "--dangerously-skip-permissions", taskPrompt]
       : ["--dangerously-skip-permissions"];
@@ -297,11 +394,48 @@ export class AITask {
         rows: 40,
       });
 
+      // Subscribe to PTY output to capture Claude Code's OAuth login URL.
+      // Claude Code prints something like:
+      //   "To sign in, visit: https://claude.ai/oauth/authorize?..."
+      // when started without an API key.
+      // We accumulate output in a buffer so that URLs split across PTY chunks
+      // are still matched reliably.
+      this.#session.onData((data) => {
+        if (this.#loginUrl) return; // already found
+        // Strip ANSI escape sequences for reliable URL matching
+        this.#stdoutBuffer += data.replace(/\x1b\[[0-9;]*[mGKHF]/g, "");
+        // Keep the buffer bounded — the URL appears early in the output and
+        // we only need enough context to span a split chunk boundary.
+        if (this.#stdoutBuffer.length > 4096) {
+          this.#stdoutBuffer = this.#stdoutBuffer.slice(-4096);
+        }
+        // Require the URL to be followed by actual whitespace so we don't
+        // capture a partial URL when a chunk boundary falls mid-URL.
+        // Using (?=\s) instead of (?=\s|$) prevents matching at end-of-buffer,
+        // which would be indistinguishable from a truncated chunk.
+        const match = this.#stdoutBuffer.match(
+          /https:\/\/claude\.ai\/oauth\/authorize\S*(?=\s)/,
+        );
+        if (match) {
+          this.#loginUrl = match[0].trim().replace(/[)\]'"]+$/, "");
+          console.log(`[ai] Task ${this.taskId}: captured login URL`);
+          this.#stdoutBuffer = ""; // release memory
+        }
+      });
+
       this.#session.onExit((code) => {
         this.#onComplete(code).catch((err) => {
           console.error(`[ai] Post-completion failed:`, err);
         });
       });
+
+      // Keep the environment from being considered idle while the task runs.
+      // The HTTP activity monitor only fires on requests; a long-running AI
+      // task produces no traffic, so reset immediately and then every 30 s.
+      resetActivity();
+      this.#activityInterval = setInterval(() => {
+        resetActivity();
+      }, 30_000);
     } catch (err) {
       this.#status = "failed";
       if (this.#tokenRefreshInterval) {
@@ -312,19 +446,136 @@ export class AITask {
     }
   }
 
+  async #commitChanges(): Promise<void> {
+    using _ = await lockerGitAPI.lock.wlock();
+    const env = gitEnv(this.#githubToken ?? undefined);
+
+    // Check for uncommitted changes (staged or unstaged)
+    const statusCmd = new Deno.Command("git", {
+      args: ["status", "--porcelain"],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    const statusOutput = await statusCmd.output();
+    const hasChanges = statusOutput.success &&
+      new TextDecoder().decode(statusOutput.stdout).trim().length > 0;
+
+    if (!hasChanges) {
+      console.log(`[ai] Task ${this.taskId}: no uncommitted changes to commit`);
+      return;
+    }
+
+    const addCmd = new Deno.Command("git", {
+      args: ["add", "-A"],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    const addOutput = await addCmd.output();
+    if (!addOutput.success) {
+      console.error(
+        `[ai] Task ${this.taskId}: git add failed: ${
+          new TextDecoder().decode(addOutput.stderr)
+        }`,
+      );
+      return;
+    }
+
+    // Unstage .agent-home so token files are never committed
+    const unstageCmd = new Deno.Command("git", {
+      args: ["reset", "--", ".agent-home"],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    await unstageCmd.output(); // best-effort; .agent-home may not exist
+
+    const commitCmd = new Deno.Command("git", {
+      args: [
+        "commit",
+        "-m",
+        `chore: apply AI task changes [${this.taskId}]`,
+      ],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    const commitOutput = await commitCmd.output();
+    if (!commitOutput.success) {
+      console.error(
+        `[ai] Task ${this.taskId}: git commit failed: ${
+          new TextDecoder().decode(commitOutput.stderr)
+        }`,
+      );
+      return;
+    }
+
+    console.log(`[ai] Task ${this.taskId}: uncommitted changes committed`);
+
+    // Get current branch name
+    const branchCmd = new Deno.Command("git", {
+      args: ["rev-parse", "--abbrev-ref", "HEAD"],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    const branchOutput = await branchCmd.output();
+    if (!branchOutput.success) {
+      console.error(`[ai] Task ${this.taskId}: failed to get branch name`);
+      return;
+    }
+    const branch = new TextDecoder().decode(branchOutput.stdout).trim();
+
+    const pushCmd = new Deno.Command("git", {
+      args: ["push", "-u", "origin", branch],
+      cwd: this.#opts.cwd,
+      stdout: "piped",
+      stderr: "piped",
+      env,
+    });
+    const pushOutput = await pushCmd.output();
+    if (!pushOutput.success) {
+      console.error(
+        `[ai] Task ${this.taskId}: git push failed: ${
+          new TextDecoder().decode(pushOutput.stderr)
+        }`,
+      );
+    } else {
+      console.log(`[ai] Task ${this.taskId}: changes pushed to ${branch}`);
+    }
+  }
+
   async #onComplete(exitCode: number): Promise<void> {
     const success = exitCode === 0;
     this.#status = success ? "completed" : "failed";
 
-    // Stop the token refresh interval — task is done
+    // Stop the token refresh and activity intervals — task is done
     if (this.#tokenRefreshInterval) {
       clearInterval(this.#tokenRefreshInterval);
       this.#tokenRefreshInterval = null;
+    }
+    if (this.#activityInterval) {
+      clearInterval(this.#activityInterval);
+      this.#activityInterval = null;
     }
 
     console.log(
       `[ai] Task ${this.taskId} exited with code ${exitCode}`,
     );
+
+    // Skip all post-exit side-effects if the task was disposed
+    if (this.#disposed) return;
+
+    // Commit any uncommitted changes left by Claude if requested
+    if (this.#opts.shouldCommitChanges === true) {
+      await this.#commitChanges();
+    }
 
     // Only run GitHub flow if this was an issue-based task
     if (!this.#issueCtx) return;
@@ -466,14 +717,20 @@ export class AITask {
       issue: this.issue,
       prompt: this.prompt,
       prUrl: this.#prUrl,
+      loginUrl: this.#loginUrl,
       createdAt: this.createdAt,
     };
   }
 
   dispose(): void {
+    this.#disposed = true;
     if (this.#tokenRefreshInterval) {
       clearInterval(this.#tokenRefreshInterval);
       this.#tokenRefreshInterval = null;
+    }
+    if (this.#activityInterval) {
+      clearInterval(this.#activityInterval);
+      this.#activityInterval = null;
     }
     if (this.#session) {
       this.#session.dispose();
