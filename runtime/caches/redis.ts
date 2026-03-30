@@ -151,7 +151,8 @@ export function create(redis: RedisConnection | null, namespace: string) {
       serialize(response)
         .then((data) =>
           waitOrReject<string | null>(
-            () => redis?.set(cacheKey, data, "EX", TTL) ?? Promise.resolve(null),
+            () =>
+              redis?.set(cacheKey, data, "EX", TTL) ?? Promise.resolve(null),
             COMMAND_TIMEOUT,
           )
         )
