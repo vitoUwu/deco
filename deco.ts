@@ -38,6 +38,8 @@ export type RequestContext = {
   userAgent?: string;
   /** Correlation ID for tracing */
   correlationId?: string;
+  /** The current block (loader/action) being executed */
+  blockId?: string;
 };
 
 export type WellKnownHostingPlatform =
@@ -84,6 +86,7 @@ export interface RequestContextBinder {
   ) => (...args: TArgs) => R;
   readonly signal: AbortSignal | undefined;
   readonly framework: "fresh" | "htmx";
+  readonly blockId: string | undefined;
 }
 
 const deploymentId = Deno.env.get("DENO_DEPLOYMENT_ID");
@@ -185,6 +188,15 @@ export const RequestContext: RequestContextBinder = {
    */
   get framework() {
     return Context.active().request?.framework ?? "fresh";
+  },
+
+  /**
+   * Gets the current block (loader/action) being executed.
+   *
+   * @returns {string | undefined} The block identifier.
+   */
+  get blockId() {
+    return Context.active().request?.blockId;
   },
 };
 // deno-lint-ignore no-explicit-any
