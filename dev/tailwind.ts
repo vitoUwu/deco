@@ -3,6 +3,7 @@ import { walk } from "@std/fs";
 import { join, SEPARATOR, toFileUrl } from "@std/path";
 import autoprefixer from "npm:autoprefixer@10.4.14";
 import cssnano from "npm:cssnano@6.0.1";
+import postcssImport from "npm:postcss-import@14.1.0";
 import postcss, { type AcceptedPlugin } from "npm:postcss@8.4.27";
 import tailwindcss, { type Config } from "npm:tailwindcss@3.4.1";
 import { resolveDeps } from "./deno.ts";
@@ -42,6 +43,7 @@ const bundle = async (
   const start = performance.now();
 
   const plugins: AcceptedPlugin[] = [
+    postcssImport(),
     tailwindcss(config),
     autoprefixer(),
   ];
