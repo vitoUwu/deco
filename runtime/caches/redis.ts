@@ -45,6 +45,7 @@ const SENTINEL_URLS = Deno.env.get("LOADER_CACHE_REDIS_SENTINEL_URLS");
 const SENTINEL_NAME = Deno.env.get("LOADER_CACHE_REDIS_SENTINEL_NAME") ??
   "mymaster";
 const SENTINEL_PASSWORD = Deno.env.get("LOADER_CACHE_REDIS_SENTINEL_PASSWORD");
+const REDIS_USERNAME = Deno.env.get("LOADER_CACHE_REDIS_USERNAME");
 const REDIS_PASSWORD = Deno.env.get("LOADER_CACHE_REDIS_PASSWORD");
 const REDIS_READ_URL = Deno.env.get("LOADER_CACHE_REDIS_READ_URL");
 
@@ -242,12 +243,14 @@ function createRedisClient(): Redis {
       sentinels: parseSentinels(SENTINEL_URLS),
       name: SENTINEL_NAME,
       ...(SENTINEL_PASSWORD && { sentinelPassword: SENTINEL_PASSWORD }),
+      ...(REDIS_USERNAME && { username: REDIS_USERNAME }),
       ...(REDIS_PASSWORD && { password: REDIS_PASSWORD }),
     });
   }
 
   return new Redis(Deno.env.get("LOADER_CACHE_REDIS_URL")!, {
     ...sharedOptions,
+    ...(REDIS_USERNAME && { username: REDIS_USERNAME }),
     ...(REDIS_PASSWORD && { password: REDIS_PASSWORD }),
   });
 }
@@ -255,6 +258,7 @@ function createRedisClient(): Redis {
 function createReadRedisClient(): Redis {
   return new Redis(REDIS_READ_URL!, {
     ...sharedOptions,
+    ...(REDIS_USERNAME && { username: REDIS_USERNAME }),
     ...(REDIS_PASSWORD && { password: REDIS_PASSWORD }),
   });
 }

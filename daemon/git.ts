@@ -57,6 +57,9 @@ export const lockerGitAPI = createLocker();
 
 export const git = simpleGit(Deno.cwd(), {
   config: ["core.editor=true"], // disable interactive editor
+  unsafe: {
+    allowUnsafeEditor: true,
+  },
   maxConcurrentProcesses: 1,
   trimmed: true,
   progress: ({ method, stage, progress }) =>
@@ -259,6 +262,11 @@ export const publish = ({ build }: Options): Handler => {
         ? parseGitHubOwnerRepo(remoteUrl) ?? undefined
         : undefined;
       await setupGithubTokenNetrc(repoOverride);
+    } else {
+      const githubToken = c.req.header("x-github-token");
+      if (githubToken) {
+        await updateNetrc(githubToken);
+      }
     }
 
     await git.fetch(["-p"]).submoduleUpdate(["--depth", "1"]);
@@ -309,6 +317,99 @@ export interface RebaseAPI {
     status: StatusResult;
   };
 }
+
+export interface CheckoutBranchAPI {
+  body: {
+    branchName: string;
+  };
+  response: {
+    branch: string;
+  };
+}
+
+export interface CheckoutExistingBranchAPI {
+  body: {
+    branchName: string;
+  };
+  response: {
+    branch: string;
+  };
+}
+
+// ─── /git/raw ─────────────────────────────────────────────────────────────────
+
+export interface GitRawAPI {
+  body: {
+    args: string[];
+  };
+  response: {
+    result: string;
+  };
+}
+
+/**
+ * Git subcommands that are safe to run via /git/raw.
+ * Intentionally excludes push, pull, clone, remote, config, gc, and other
+ * operations that can affect the remote, global config, or be irreversible.
+ */
+const ALLOWED_SUBCOMMANDS = new Set([
+  "checkout",
+  "branch",
+  "stash",
+  "tag",
+  "log",
+  "show",
+  "diff",
+  "merge",
+  "cherry-pick",
+  "format-patch",
+  "describe",
+  "shortlog",
+  "rev-parse",
+  "rev-list",
+  "ls-files",
+  "ls-tree",
+  "cat-file",
+  "revert",
+  "fetch",
+]);
+
+/**
+ * Flags that are blocked regardless of subcommand, as they can cause
+ * irreversible damage or break system-level git configuration.
+ */
+const BLOCKED_FLAGS = new Set([
+  "--force",
+  "-f",
+  "--hard",
+  "--global",
+  "--system",
+  "--exec",
+]);
+
+const validateRawArgs = (args: string[]): string | null => {
+  if (!args.length) return "No git arguments provided";
+
+  const subcommand = args[0];
+  if (!ALLOWED_SUBCOMMANDS.has(subcommand)) {
+    return `Subcommand "${subcommand}" is not allowed. Allowed: ${[...ALLOWED_SUBCOMMANDS].join(", ")}`;
+  }
+
+  const blockedFlag = args.find((arg) => {
+    if (arg.startsWith("--")) {
+      return BLOCKED_FLAGS.has(arg.split("=")[0]);
+    }
+    if (arg.startsWith("-") && arg.length > 1) {
+      return [...arg.slice(1)].some((ch) => BLOCKED_FLAGS.has(`-${ch}`));
+    }
+    return false;
+  });
+  if (blockedFlag) {
+    return `Flag "${blockedFlag}" is blocked`;
+  }
+
+  return null;
+};
 
 const abortRebase = async () => {
   await git.rebase({ "--abort": null });
@@ -746,6 +847,53 @@ interface Options {
   site: string;
 }
 
+export const gitRaw: Handler = async (c) => {
+  const { args } = (await c.req.json()) as GitRawAPI["body"];
+
+  const validationError = validateRawArgs(args);
+  if (validationError) {
+    return new Response(validationError, { status: 400 });
+  }
+
+  const result = await git.raw(args);
+
+  return Response.json({ result });
+};
+
+export const checkoutBranch: Handler = async (c) => {
+  const { branchName } = (await c.req.json()) as CheckoutBranchAPI["body"];
+
+  if (!branchName || !/^[a-zA-Z0-9_\-./]+$/.test(branchName)) {
+    return new Response("Invalid branch name", { status: 400 });
+  }
+
+  await git.checkoutLocalBranch(branchName);
+
+  return Response.json({ branch: branchName });
+};
+
+export const checkoutExistingBranch: Handler = async (c) => {
+  const { branchName } =
+    (await c.req.json()) as CheckoutExistingBranchAPI["body"];
+
+  if (!branchName || !/^[a-zA-Z0-9_\-./]+$/.test(branchName)) {
+    return new Response("Invalid branch name", { status: 400 });
+  }
+
+  const branches = await git.branch(["-a"]);
+  const exists = Object.keys(branches.branches).some(
+    (b) => b === branchName || b === `remotes/origin/${branchName}`,
+  );
+
+  if (!exists) {
+    return new Response(`Branch "${branchName}" not found`, { status: 404 });
+  }
+
+  await git.checkout(branchName);
+
+  return Response.json({ branch: branchName });
+};
+
 export const createGitAPIS = (options: Options) => {
   const app = new Hono();
 
@@ -756,6 +904,9 @@ export const createGitAPIS = (options: Options) => {
   app.post("/publish", publish(options));
   app.post("/discard", discard);
   app.post("/rebase", rebase);
+  app.post("/checkout-branch", checkoutBranch);
+  app.post("/checkout", checkoutExistingBranch);
+  app.post("/raw", gitRaw);
 
   return app;
 };

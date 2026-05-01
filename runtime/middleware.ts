@@ -76,9 +76,6 @@ export type DecoMiddlewareContext<
   I extends Input = {},
 > = HonoContext<DecoRouteState<TManifest>, P, I> & { render: ContextRenderer };
 
-const DISABLE_ROUTING_LOGGING =
-  Deno.env.get("DISABLE_ROUTING_LOGGING") === "true";
-
 export const createHandler = <TManifest extends AppManifest = AppManifest>(
   handler: DecoHandler<TManifest>,
 ): DecoHandler<TManifest> =>
@@ -112,7 +109,7 @@ const DEBUG_COOKIE = "deco_debug";
 const DEBUG_ENABLED = "enabled";
 const PAGE_CACHE_ENABLED = Deno.env.get("DECO_PAGE_CACHE_ENABLED") === "true";
 const PAGE_CACHE_CONTROL = Deno.env.get("DECO_PAGE_CACHE_CONTROL") ??
-  "public, max-age=90, s-maxage=90, stale-while-revalidate=30";
+  "public, max-age=90, s-maxage=90, stale-while-revalidate=3600, stale-if-error=86400";
 
 export const DEBUG_QS = "__d";
 const addHours = (date: Date, h: number) => {
@@ -322,17 +319,13 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
               span.updateName(`${ctx.req.raw.method} ${ctx.req.raw.url}`);
             }
             span.end();
-            if (
-              !url.pathname.startsWith("/_frsh") && !DISABLE_ROUTING_LOGGING
-            ) {
+            if (ctx.var.debugEnabled && !url.pathname.startsWith("/_frsh")) {
               console.info(
                 formatLog({
                   status: ctx.res?.status ?? 500,
                   url,
                   begin,
-                  timings: ctx.var.debugEnabled
-                    ? ctx.var.monitoring.timings.get()
-                    : undefined,
+                  timings: ctx.var.monitoring.timings.get(),
                 }),
               );
             }
