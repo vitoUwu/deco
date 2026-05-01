@@ -7,7 +7,10 @@ import {
 } from "./utils.ts";
 import { Buffer } from "node:buffer";
 import { Redis } from "npm:ioredis@^5.10.1";
-import { compress as lz4Compress, decompress as lz4Decompress } from "jsr:@denosaurs/lz4@^0.1.4";
+import {
+  compress as lz4Compress,
+  decompress as lz4Decompress,
+} from "jsr:@denosaurs/lz4@^0.1.4";
 import {
   compress as zstdCompress,
   decompress as zstdDecompress,
@@ -115,7 +118,9 @@ export async function _compress(
   }
 
   if (codec !== CODEC_GZIP && codec !== CODEC_DEFLATE) {
-    throw new Error(`[redis-cache] unknown compression codec: 0x${codec.toString(16)}`);
+    throw new Error(
+      `[redis-cache] unknown compression codec: 0x${codec.toString(16)}`,
+    );
   }
   // gzip / deflate-raw — native Deno, no deps
   const algo = codec === CODEC_GZIP ? "gzip" : "deflate-raw";
@@ -145,7 +150,9 @@ export async function _decompress(data: Uint8Array): Promise<string> {
   }
 
   if (codec !== CODEC_GZIP && codec !== CODEC_DEFLATE) {
-    throw new Error(`[redis-cache] unknown compression codec: 0x${codec.toString(16)}`);
+    throw new Error(
+      `[redis-cache] unknown compression codec: 0x${codec.toString(16)}`,
+    );
   }
   // gzip / deflate-raw — native Deno
   const algo = codec === CODEC_GZIP ? "gzip" : "deflate-raw";
@@ -383,8 +390,8 @@ export function create(
       serialize(response)
         .then((data) =>
           waitOrReject<string | null>(
-            // deno-lint-ignore no-explicit-any
             () =>
+              // deno-lint-ignore no-explicit-any
               redis?.set(cacheKey, data as any, "EX", ttlSeconds) ??
                 Promise.resolve(null),
             COMMAND_TIMEOUT,

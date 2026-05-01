@@ -453,8 +453,91 @@ const invokeResolverWithProps = async <
 
   // TODO: (@tlgimenes) create resolverId outside of the request cycle
   const resolverId = resolverIdFromResolveChain(ctx.resolveChain);
-  const timing = resolverId
-    ? ctx.monitoring?.timings.start(resolverId)
+
+  let timingDesc: string | undefined;
+  let improvedName: string | undefined;
+
+  if (ctx.resolveChain && ctx.resolveChain.length > 0) {
+    const lastResolver = ctx.resolveChain.findLast((r) =>
+      r.type === "resolver"
+    );
+    const lastResolvable = ctx.resolveChain.findLast((r) =>
+      r.type === "resolvable"
+    );
+    const lastProp = ctx.resolveChain.findLast((r) => r.type === "prop");
+    const parts: string[] = [];
+
+    if (lastResolver) {
+      parts.push(`resolver:${lastResolver.value}`);
+    }
+    if (lastResolvable) {
+      parts.push(`resolvable:${lastResolvable.value}`);
+    }
+    if (lastProp) {
+      let propValue: string;
+      if (typeof lastProp.value === "object" && lastProp.value !== null) {
+        const obj = lastProp.value as Record<string, unknown>;
+        if ("__resolveType" in obj && typeof obj.__resolveType === "string") {
+          propValue = obj.__resolveType;
+        } else if ("name" in obj && typeof obj.name === "string") {
+          propValue = obj.name;
+        } else if ("type" in obj && typeof obj.type === "string") {
+          propValue = obj.type;
+        } else {
+          const keys = Object.keys(obj).slice(0, 5);
+          propValue = keys.length > 0 ? `obj[${keys.join(",")}]` : "obj";
+        }
+      } else {
+        propValue = String(lastProp.value);
+      }
+      parts.push(`prop:${propValue}`);
+
+      if (
+        resolverId.includes("[object Object]") || resolverId === "obj" ||
+        resolverId === ""
+      ) {
+        if (typeof lastProp.value === "object" && lastProp.value !== null) {
+          const obj = lastProp.value as Record<string, unknown>;
+          if ("__resolveType" in obj && typeof obj.__resolveType === "string") {
+            improvedName = `${
+              lastResolvable?.value || "unknown"
+            }@${obj.__resolveType}`;
+          } else if ("name" in obj && typeof obj.name === "string") {
+            improvedName = `${lastResolvable?.value || "unknown"}@${obj.name}`;
+          } else if (lastResolvable) {
+            const keys = Object.keys(obj).slice(0, 3).join(",");
+            improvedName = keys
+              ? `${lastResolvable.value}@obj[${keys}]`
+              : `${lastResolvable.value}@obj`;
+          }
+        }
+      }
+    }
+    if (__resolveType) {
+      parts.push(`type:${__resolveType}`);
+      if (
+        !improvedName &&
+        (resolverId === "" || resolverId === "obj" ||
+          resolverId.includes("[object Object]"))
+      ) {
+        improvedName = __resolveType;
+      }
+    }
+
+    if (parts.length > 0) {
+      timingDesc = parts.join(" | ");
+    }
+  } else if (__resolveType) {
+    timingDesc = `type:${__resolveType}`;
+    if (!resolverId || resolverId === "" || resolverId === "obj") {
+      improvedName = __resolveType;
+    }
+  }
+
+  const finalResolverId = improvedName || resolverId || "unknown";
+
+  const timing = finalResolverId && finalResolverId !== "unknown"
+    ? ctx.monitoring?.timings.start(finalResolverId, timingDesc)
     : undefined;
 
   // Shallow copy to avoid resolvers getting the currentSpan from one another

@@ -27,7 +27,9 @@ export const wrapInvokeErr =
             code: "SWW",
           }),
           {
-            status: 500,
+            status: "status" in err && typeof err.status === "number"
+              ? err.status
+              : 500,
             headers: {
               "x-correlation-id": correlationId,
               "content-type": "application/json",
@@ -55,6 +57,21 @@ export const payloadToResolvable = (
 ): Resolvable => {
   if (isInvokeFunc(p)) {
     return payloadForFunc(p);
+  }
+
+  // Prevent recursion on primitive values (strings, numbers, booleans, null, undefined)
+  if (typeof p !== "object" || p === null || Array.isArray(p)) {
+    throw new HttpError(
+      new Response(
+        `Invalid payload: expected object with InvokeFunction properties, got ${typeof p}`,
+        {
+          status: 400,
+          headers: {
+            "content-type": "text/plain",
+          },
+        },
+      ),
+    );
   }
 
   const resolvable: Resolvable = {};
