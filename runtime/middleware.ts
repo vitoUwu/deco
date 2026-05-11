@@ -447,8 +447,10 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
       const isPageDirty = ctx.var.bag?.has(PAGE_DIRTY_KEY);
 
       if (hasSetCookie) {
-        // Set-cookie present: never cache (same behavior as main)
-        newHeaders.set("Cache-Control", "no-store, no-cache, must-revalidate");
+        // Set-cookie present: use private+no-cache instead of no-store so that
+        // the browser's back/forward cache (bfcache) is not blocked. CDN caching
+        // is still prevented by the `private` directive.
+        newHeaders.set("Cache-Control", "private, no-cache, must-revalidate");
       } else if (isHtmlResponse && PAGE_CACHE_ENABLED && !isPageDirty) {
         const flags = ctx.var?.flags ?? [];
         const allFlagsCacheable = flags.length > 0
@@ -458,9 +460,9 @@ export const middlewareFor = <TAppManifest extends AppManifest = AppManifest>(
         if (!allFlagsCacheable) {
           newHeaders.set(
             "Cache-Control",
-            "no-store, no-cache, must-revalidate",
+            "private, no-cache, must-revalidate",
           );
-        } else if (!newHeaders.has("Cache-Control")) {
+        } else {
           newHeaders.set("Cache-Control", PAGE_CACHE_CONTROL);
         }
       }
