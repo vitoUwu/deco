@@ -13,6 +13,8 @@ export interface InvokableManifest {
   functions?: Record<string, unknown>;
 }
 
+const ENCODED_SLASH_PATTERN = /%2f/i;
+
 const stripTerminalExtension = (key: string) => key.replace(/\.(tsx?)$/, "");
 
 const safeDecodeURIComponent = (value: string): string => {
@@ -26,7 +28,7 @@ const safeDecodeURIComponent = (value: string): string => {
 export function resolveInvokePath(
   rawPath: string,
   invokableKeys: Iterable<string>,
-): ResolvedInvokePath {
+): ResolvedInvokePath | undefined {
   const path = rawPath.replace(/^\/+|\/+$/g, "");
   const matches = [...invokableKeys]
     .map((key) => ({ key, extensionlessKey: stripTerminalExtension(key) }))
@@ -45,12 +47,15 @@ export function resolveInvokePath(
     ? match.key
     : match.extensionlessKey;
   const suffix = path.slice(prefix.length).replace(/^\//, "");
+  const encodedSegments = suffix ? suffix.split("/") : [];
+
+  if (encodedSegments.some((segment) => ENCODED_SLASH_PATTERN.test(segment))) {
+    return undefined;
+  }
 
   return {
     key: match.key,
-    dynamicSegments: suffix
-      ? suffix.split("/").map(safeDecodeURIComponent)
-      : [],
+    dynamicSegments: encodedSegments.map(safeDecodeURIComponent),
   };
 }
 
@@ -97,9 +102,20 @@ export function resolveDynamicInvokeProps(
   key: string,
   props: Record<string, unknown> | undefined,
   manifest: InvokableManifest,
-): { key: string; props: Record<string, unknown> | undefined } {
+): { key: string; props: Record<string, unknown> | undefined } | undefined {
   const resolved = resolveInvokePath(key, invokableKeysFromManifest(manifest));
+  if (!resolved) {
+    return undefined;
+  }
+
   const block = blockFromManifest(manifest, resolved.key);
+  if (
+    resolved.dynamicSegments.length &&
+    (!block?.dynamicParams?.length ||
+      resolved.dynamicSegments.length > block.dynamicParams.length)
+  ) {
+    return undefined;
+  }
 
   return {
     key: resolved.key,

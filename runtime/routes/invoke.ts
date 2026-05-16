@@ -94,11 +94,23 @@ export const handler = createHandler(async (
   }
 
   const manifest = runtime.manifest;
-  const { key, dynamicSegments } = resolveInvokePath(
+  const resolvedPath = resolveInvokePath(
     rawKey,
     invokableKeysFromManifest(manifest),
   );
+  if (!resolvedPath) {
+    return new Response("Invalid invoke path", { status: 400 });
+  }
+
+  const { key, dynamicSegments } = resolvedPath;
   const block = blockFromManifest(manifest, key);
+  if (
+    dynamicSegments.length &&
+    (!block?.dynamicParams?.length ||
+      dynamicSegments.length > block.dynamicParams.length)
+  ) {
+    return new Response("Invalid invoke path", { status: 400 });
+  }
 
   const props = mergeDynamicProps(
     await parsePropsFromRequest(ctx.req.raw),

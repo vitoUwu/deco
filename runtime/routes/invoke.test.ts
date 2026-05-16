@@ -42,14 +42,23 @@ Deno.test("resolveInvokePath extracts suffix segments after extensionless keys",
 
 Deno.test("resolveInvokePath decodes dynamic suffix segments", () => {
   const resolved = resolveInvokePath(
-    "site/loaders/product/review/MODEL%2FBLUE",
+    "site/loaders/product/review/MODEL%20BLUE",
     ["site/loaders/product/review.ts"],
   );
 
   assertEquals(resolved, {
     key: "site/loaders/product/review.ts",
-    dynamicSegments: ["MODEL/BLUE"],
+    dynamicSegments: ["MODEL BLUE"],
   });
+});
+
+Deno.test("resolveInvokePath rejects encoded slashes in dynamic suffix segments", () => {
+  const resolved = resolveInvokePath(
+    "site/loaders/product/review/MODEL%2FBLUE",
+    ["site/loaders/product/review.ts"],
+  );
+
+  assertEquals(resolved, undefined);
 });
 
 Deno.test("resolveInvokePath keeps malformed URI segments unchanged", () => {
@@ -81,6 +90,20 @@ Deno.test("resolveDynamicInvokeProps maps path segments to dynamic params", () =
     key: "site/loaders/product/review.ts",
     props: { ignored: "query", model: "SOMEMODEL" },
   });
+});
+
+Deno.test("resolveDynamicInvokeProps rejects suffix segments without dynamic params", () => {
+  const resolved = resolveDynamicInvokeProps(
+    "site/loaders/product/review/SOMEMODEL",
+    { ignored: "query" },
+    {
+      loaders: {
+        "site/loaders/product/review.ts": {},
+      },
+    },
+  );
+
+  assertEquals(resolved, undefined);
 });
 
 Deno.test("resolveDynamicInvokeProps lets path params override props", () => {

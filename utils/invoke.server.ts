@@ -51,6 +51,9 @@ export const buildInvokeFunc = <
         manifest,
       )
       : { key, props };
+    if (!resolved) {
+      throw new Error("Invalid invoke path");
+    }
 
     return resolver<Awaited<ReturnType<InvocationFunc<TManifest>>>>(
       payloadForFunc(resolved as InvokeFunction<TManifest>),
