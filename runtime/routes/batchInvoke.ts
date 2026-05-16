@@ -1,6 +1,6 @@
 // deno-lint-ignore-file no-explicit-any
 
-import type { Resolvable } from "../../mod.ts";
+import { HttpError, type Resolvable } from "../../mod.ts";
 
 import { isAdminOrLocalhost } from "../../utils/admin.ts";
 import { allowCorsFor, bodyFromUrl } from "../../utils/http.ts";
@@ -24,6 +24,21 @@ export const payloadToResolvable = (
 ): Resolvable => {
   if (isInvokeFunc(p)) {
     return payloadForFunc(p);
+  }
+
+  // Prevent recursion on primitive values (strings, numbers, booleans, null, undefined)
+  if (typeof p !== "object" || p === null || Array.isArray(p)) {
+    throw new HttpError(
+      new Response(
+        `Invalid payload: expected object with InvokeFunction properties, got ${typeof p}`,
+        {
+          status: 400,
+          headers: {
+            "content-type": "text/plain",
+          },
+        },
+      ),
+    );
   }
 
   const resolvable: Resolvable = {};

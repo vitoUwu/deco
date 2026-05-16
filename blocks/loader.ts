@@ -308,7 +308,16 @@ const wrapLoader = (
             new Response(jsonStringEncoded, {
               headers: Object.fromEntries(headerPairs),
             }),
-          ).catch((error) => logger.error(`loader error ${error}`));
+          ).catch((error) =>
+            logger.error(`loader error ${error}`, {
+              loader,
+              cacheKey: cacheKeyValue,
+              error: {
+                message: error.message,
+                stack: error.stack,
+              },
+            })
+          );
 
           return json;
         };
@@ -336,13 +345,41 @@ const wrapLoader = (
                 if (!acquired) return;
                 return bgFlights.do(request.url, callHandlerAndCache);
               })
-              .catch((error) => logger.error(`loader error ${error}`));
+              .catch((error) =>
+                logger.error(`loader error ${error}`, {
+                  loader,
+                  cacheKey: cacheKeyValue,
+                  error: {
+                    message: error.message,
+                    stack: error.stack,
+                  },
+                })
+              );
           } else {
             status = "hit";
             stats.cache.add(1, { status, loader });
           }
 
-          return await matched.json();
+          try {
+            return await matched.json();
+          } catch (e) {
+            const err = e as Error;
+            logger.error(
+              `Failed to parse cached response, falling back to handler: ${err}`,
+              {
+                loader,
+                cacheKey: cacheKeyValue,
+                error: {
+                  message: err.message,
+                  stack: err.stack,
+                },
+                body: await matched.text().catch(() => "failed to get body"),
+              },
+            );
+            status = "miss";
+            stats.cache.add(1, { status, loader });
+            return await callHandlerAndCache();
+          }
         };
 
         return await flights.do(request.url, staleWhileRevalidate);
